@@ -1,3 +1,4 @@
+using Assets.Scripts.WaterSim.Visualization;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -29,14 +30,14 @@ public class WaterSim : MonoBehaviour
     public float wallDistance = 0.1f;
 
     [Header("Visualization")]
-    public GameObject prefab;
+    public Material material;
 
     private Vector3[] positions;
     private Vector3[] velocities;
     private float[] density;
     private float[] pressure;
-
-    private PrefabVisualizer visualizer;
+     
+    private ParticleVisualizer particleVisualizer;
     private static readonly Vector3 g = new Vector3(0, -9.8f, 0);
 
     void Start()
@@ -48,7 +49,8 @@ public class WaterSim : MonoBehaviour
         velocities = new Vector3[count];
         density = new float[count];
         pressure = new float[count];
-        visualizer = new PrefabVisualizer(prefab, count, transform, radius);
+       // visualizer = new PrefabVisualizer(prefab, count, transform, radius);
+        particleVisualizer = new ParticleVisualizer(material);
     }
 
     // Update is called once per frame
@@ -202,7 +204,11 @@ public class WaterSim : MonoBehaviour
 
     private void Draw()
     {
-        visualizer.DrawBB(bounds);
-        visualizer.DrawPoints(positions);
+        Vector3[] colors = new Vector3[velocities.Length];
+        for (int i = 0; i < velocities.Length; i++)
+        {
+            colors[i] = (velocities[i] / 10 + new Vector3(1, 1, 1)) / 2; 
+        }
+        particleVisualizer.Draw(positions, 0.5f, colors);
     }
 }
