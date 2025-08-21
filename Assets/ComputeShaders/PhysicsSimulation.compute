@@ -1,0 +1,181 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel DensityPressure
+#pragma kernel WallForce
+#pragma kernel PressureForce
+#pragma kernel ComputePositions
+
+RWStructuredBuffer<float3> positions;
+RWStructuredBuffer<float3> velocities;
+RWStructuredBuffer<float> density;
+RWStructuredBuffer<float> pressure;
+
+cbuffer Params
+{
+    int count;
+    float mass;
+    float radius;
+    float restDensity;
+    float restPressure;
+    float4 minBounds;
+    float4 maxBounds;
+    float wallDistance;
+    float wallForce;
+    float viscosuty;
+    float fixedDeltaTime;
+};
+
+float Poly6(float r2, float h)
+{
+    // poly6(r, h) = 315/(64 * π * h^9) * (h^2 - r^2)^3, 0 <= r <= h
+    float h2 = h * h;
+    if (r2 >= 0 && r2 <= h2)
+    {
+        float coeff = 315.0 / (64.0 * 3.14159265 * pow(h, 9));
+        float diff = h2 - r2;
+        return coeff * diff * diff * diff;
+    }
+    return 0.0;
+}
+
+float3 SpikyGrad(float h, float3 r_vec)
+{
+    // ∇spiky(r, h) = -45 / (π * h^6) * (|h| - |r|)^2 * norm(r)
+    float pi = 3.14159265;
+    float r = length(r_vec);
+    if (r < 0.0001 || r > h)
+        return float3(0, 0, 0);
+
+    return -45.0 / (pi * pow(h, 6)) * (h - r) * (h - r) * (r_vec / r);
+}
+
+float ViscosityLaplas(float h, float r)
+{
+    // ∇^2viscosity(r, h) = 45 / (π * h^6) * (h - r)
+    float pi = 3.14159265;
+    if (r < 0.0001 || r > h)
+        return 0;
+    
+    return 45.0 / (pi * pow(h, 6)) * (h - r);
+}
+
+[numthreads(256, 1, 1)]
+void DensityPressure(uint id : SV_DispatchThreadID)
+{
+    if (id >= count)
+        return;
+
+    float dens = 0.0;
+    float h = radius * 4.0;
+
+    for (uint j = 0; j < count; j++)
+    {
+        float3 r_vec = positions[id] - positions[j];
+        dens += mass * Poly6(dot(r_vec, r_vec), h);
+    }
+
+    density[id] = dens;
+    pressure[id] = restPressure * (dens - restDensity);
+}
+
+[numthreads(256, 1, 1)]
+void WallForce(uint id : SV_DispatchThreadID)
+{
+    if (id >= count)
+        return;
+     
+    float3 minDistance = positions[id] - minBounds.xyz;
+    if (minDistance.x <= wallDistance)
+        velocities[id].x += lerp(wallForce, 0, 1 - max(minDistance.x / wallDistance + 0.01, 0.01));
+    if (minDistance.y <= wallDistance)
+        velocities[id].y += lerp(wallForce, 0, 1 - max(minDistance.y / wallDistance + 0.01, 0.01));
+    if (minDistance.z <= wallDistance)
+        velocities[id].z += lerp(wallForce, 0, 1 - max(minDistance.z / wallDistance + 0.01, 0.01));
+
+    float3 maxDistance = maxBounds.xyz - positions[id];
+    if (maxDistance.x <= wallDistance)
+        velocities[id].x += lerp(-wallForce, 0, 1 - max(maxDistance.x / wallDistance + 0.01, 0.01));
+    if (maxDistance.y <= wallDistance)
+        velocities[id].y += lerp(-wallForce, 0, 1 - max(maxDistance.y / wallDistance + 0.01, 0.01));
+    if (maxDistance.z <= wallDistance)
+        velocities[id].z += lerp(-wallForce, 0, 1 - max(maxDistance.z / wallDistance + 0.01, 0.01));
+    if (positions[id].y <= minBounds.y)
+    {
+        velocities[id].y = 0;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void PressureForce(uint id : SV_DispatchThreadID)
+{
+    float3 forcePressute = float3(0, 0, 0);
+    float3 forceViscosity = float3(0, 0, 0);
+    float3 g = float3(0, -10, 0);
+    float h = radius * 4.0;
+    for (int j = 0; j < count; j++)
+    {
+        if (id == j)
+            continue;
+
+        float3 r_vec = positions[id] - positions[j];
+        float r = length(r_vec);
+
+        if (r < h && density[id] > 0 && density[j] > 0)
+        {
+        // давление
+            forcePressute += -mass * (pressure[id] + pressure[j]) / (2.0 * density[id] * density[j])
+                         * SpikyGrad(h, r_vec);
+
+        // вязкость
+            forceViscosity += viscosuty * mass * (velocities[j] - velocities[id]) / density[j]
+                          * ViscosityLaplas(h, r);
+        }
+    }
+
+    velocities[id] += fixedDeltaTime * (forcePressute + forceViscosity + g);
+    
+    float len = dot(velocities[id], velocities[id]);
+    if (len > 100)
+        velocities[id] = velocities[id] / sqrt(len) * 10;
+}
+
+[numthreads(256, 1, 1)]
+void ComputePositions(uint id : SV_DispatchThreadID)
+{
+    positions[id] += fixedDeltaTime * velocities[id];
+    if (positions[id].x < minBounds.x)
+    {
+        positions[id].x = minBounds.x;
+        if (velocities[id].x < 0)
+            velocities[id].x *= -0.5f;
+    }
+    if (positions[id].x > maxBounds.x)
+    {
+        positions[id].x = maxBounds.x;
+        if (velocities[id].x > 0)
+            velocities[id].x *= -0.5f;
+    }
+    if (positions[id].y < minBounds.y)
+    {
+        positions[id].y = minBounds.y;
+        if (velocities[id].y < 0)
+            velocities[id].y *= -0.5f;
+    }
+    if (positions[id].y > maxBounds.y)
+    {
+        positions[id].y = maxBounds.y;
+        if (velocities[id].y > 0)
+            velocities[id].y *= -0.5f;
+    }
+    if (positions[id].z < minBounds.z)
+    {
+        positions[id].z = minBounds.z;
+        if (velocities[id].z < 0)
+            velocities[id].z *= -0.5f;
+    }
+    if (positions[id].z > maxBounds.z)
+    {
+        positions[id].z = maxBounds.z;
+        if (velocities[id].z > 0)
+            velocities[id].z *= -0.5f;
+    }
+}

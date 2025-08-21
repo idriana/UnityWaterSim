@@ -3,6 +3,8 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Diagnostics;
+using UnityEngine.Profiling;
+using static UnityEditor.ShaderData;
 
 public class WaterSim : MonoBehaviour
 {
@@ -21,6 +23,7 @@ public class WaterSim : MonoBehaviour
     public float restPressure = 100;
     [Range(0, 1f)]
     public float smoothingCoeff = 0.1f;
+    public ComputeShader physicsCompute;
 
     [Header("Walls")]
     public Bounds bounds = new Bounds(Vector3.zero, new Vector3(3, 3, 3));
@@ -31,6 +34,8 @@ public class WaterSim : MonoBehaviour
 
     [Header("Visualization")]
     public Material material;
+    [Range(0, 1f)]
+    public float visualRadius = 0.5f;
 
     private Vector3[] positions;
     private Vector3[] velocities;
@@ -40,6 +45,11 @@ public class WaterSim : MonoBehaviour
     private ParticleVisualizer particleVisualizer;
     private static readonly Vector3 g = new Vector3(0, -9.8f, 0);
 
+    ComputeBuffer posBuffer;
+    ComputeBuffer velocityBuffer;
+    ComputeBuffer densityBuffer;
+    ComputeBuffer pressureBuffer;
+
     void Start()
     {
         positions = new Vector3[count];
@@ -47,66 +57,87 @@ public class WaterSim : MonoBehaviour
             positions[i] = RandomExtensions.Random(bounds.min, bounds.max);
 
         velocities = new Vector3[count];
-        density = new float[count];
-        pressure = new float[count];
-       // visualizer = new PrefabVisualizer(prefab, count, transform, radius);
+
+        posBuffer = new ComputeBuffer(count, sizeof(float) * 3);
+        velocityBuffer = new ComputeBuffer(count, sizeof(float) * 3);
+        densityBuffer = new ComputeBuffer(count, sizeof(float));
+        pressureBuffer = new ComputeBuffer(count, sizeof(float));
+
+        posBuffer.SetData(positions);
+
+        // visualizer = new PrefabVisualizer(prefab, count, transform, radius);
         particleVisualizer = new ParticleVisualizer(material);
     }
 
     // Update is called once per frame
-    void Update()
+    void FixedUpdate()
     {
+        Profiler.BeginSample("FixedUpdate");
+
+        Profiler.BeginSample("ComputeDensityPressure");
         ComputeDensityPressure();
-        ComputeVelocities();
+        Profiler.EndSample();
+
+        Profiler.BeginSample("ComputeWallForce");
+        ComputeWallForce();
+        Profiler.EndSample();
+
+        Profiler.BeginSample("ComputePressureDensity");
+        ComputePressureDensity();
+        Profiler.EndSample();
+
+        Profiler.BeginSample("ComputePositions");
         ComputePositions();
+        Profiler.EndSample();
+
+        posBuffer.GetData(positions);
+        velocityBuffer.GetData(velocities);
+
+        Profiler.EndSample();
+    }
+
+    private void Update()
+    {
         Draw();
     }
 
     private void ComputeDensityPressure()
     {
-        for (int i = 0; i < count; i++)
-        {
-            density[i] = 0;
-            for (int j = 0; j < count; j++)
-            {
-                Vector3 r_vec = positions[i] - positions[j];
-                density[i] += mass * Kernels.Poly6(r_vec.sqrMagnitude, radius * 4);
-            }
-            pressure[i] = restPressure * (density[i] - restDensity);
-        }
-    }
+        int kernel = physicsCompute.FindKernel("DensityPressure");
 
-    private void ComputeVelocities()
-    {
-        ComputeWallForce();
-        ComputePressureDensity();
-        XSPHCorrection();
+        physicsCompute.SetInt("count", count);
+        physicsCompute.SetFloat("mass", mass);
+        physicsCompute.SetFloat("radius", radius);
+        physicsCompute.SetFloat("restDensity", restDensity);
+        physicsCompute.SetFloat("restPressure", restPressure);
+
+        physicsCompute.SetBuffer(kernel, "positions", posBuffer);
+        physicsCompute.SetBuffer(kernel, "density", densityBuffer);
+        physicsCompute.SetBuffer(kernel, "pressure", pressureBuffer);
+
+        int threadGroups = Mathf.CeilToInt(count / 256f);
+        physicsCompute.Dispatch(kernel, threadGroups, 1, 1);
     }
 
     private void ComputePressureDensity()
     {
-        for (int i = 0; i < count; i++)
-        {
-            Vector3 forcePressute = Vector3.zero;
-            Vector3 forceViscosity = Vector3.zero;
-            for (int j = 0; j < count; j++)
-            {
-                if (i == j)
-                    continue;
+        int kernel = physicsCompute.FindKernel("PressureForce");
 
-                Vector3 r_vec = positions[i] - positions[j];
-                float r = r_vec.magnitude;
+        physicsCompute.SetInt("count", count);
+        physicsCompute.SetFloat("mass", mass);
+        physicsCompute.SetFloat("radius", radius);
+        physicsCompute.SetFloat("restDensity", restDensity);
+        physicsCompute.SetFloat("restPressure", restPressure);
+        physicsCompute.SetFloat("viscosuty", viscosuty);
+        physicsCompute.SetFloat("fixedDeltaTime", Time.fixedDeltaTime);
 
-                if (r < radius * 4 && density[j] != 0)
-                {
-                    forcePressute += -mass * (pressure[i] + pressure[j]) / (2 * density[j]) * Kernels.SpikyGrad(radius * 4, r_vec);
-                    forceViscosity += viscosuty * mass * (velocities[j] - velocities[i]) / density[j] * Kernels.ViscosityLaplas(radius * 4, r);
-                }
-            }
-            velocities[i] += Time.fixedDeltaTime * (forcePressute + forceViscosity + g);
-            if (velocities[i].sqrMagnitude > 100)
-                velocities[i] = velocities[i].normalized * 10;
-        }
+        physicsCompute.SetBuffer(kernel, "positions", posBuffer);
+        physicsCompute.SetBuffer(kernel, "density", densityBuffer);
+        physicsCompute.SetBuffer(kernel, "pressure", pressureBuffer);
+        physicsCompute.SetBuffer(kernel, "velocities", velocityBuffer);
+
+        int threadGroups = Mathf.CeilToInt(count / 256f);
+        physicsCompute.Dispatch(kernel, threadGroups, 1, 1);
     }
 
     private void XSPHCorrection()
@@ -133,73 +164,29 @@ public class WaterSim : MonoBehaviour
 
     private void ComputeWallForce()
     {
-        for (int i = 0; i < count; i++)
-        {
-            Vector3 minDistance = positions[i] - bounds.min;
-            if (minDistance.x <= wallDistance)
-                velocities[i].x += Mathf.Lerp(wallForce, 0f, 1 - Mathf.Max(minDistance.x / wallDistance + 0.01f, 0.01f));
-            if (minDistance.y <= wallDistance)
-                velocities[i].y += Mathf.Lerp(wallForce, 0f, 1 - Mathf.Max(minDistance.y / wallDistance + 0.01f, 0.01f));
-            if (minDistance.z <= wallDistance)
-                velocities[i].z += Mathf.Lerp(wallForce, 0f, 1 - Mathf.Max(minDistance.z / wallDistance + 0.01f, 0.01f));
+        int kernel = physicsCompute.FindKernel("WallForce");
 
-            Vector3 maxDistance = bounds.max - positions[i];
-            if (maxDistance.x <= wallDistance)
-                velocities[i].x += Mathf.Lerp(-wallForce, 0f, 1 - Mathf.Max(maxDistance.x / wallDistance + 0.01f, 0.01f));
-            if (maxDistance.y <= wallDistance)
-                velocities[i].y += Mathf.Lerp(-wallForce, 0f, 1 - Mathf.Max(maxDistance.y / wallDistance + 0.01f, 0.01f));
-            if (maxDistance.z <= wallDistance)
-                velocities[i].z += Mathf.Lerp(-wallForce, 0f, 1 - Mathf.Max(maxDistance.z / wallDistance + 0.01f, 0.01f));
-            if (positions[i].y <= bounds.min.y)
-            {
-                velocities[i].y -= Time.fixedDeltaTime * g.y;
-            }
-        }
+        physicsCompute.SetVector("minBounds", new Vector4(bounds.min.x, bounds.min.y, bounds.min.z, 0));
+        physicsCompute.SetVector("maxBounds", new Vector4(bounds.max.x, bounds.max.y, bounds.max.z, 0));
+        physicsCompute.SetFloat("wallDistance", wallDistance);
+        physicsCompute.SetFloat("wallForce", wallForce);
+
+        physicsCompute.SetBuffer(kernel, "positions", posBuffer);
+        physicsCompute.SetBuffer(kernel, "velocities", velocityBuffer);
+
+        int threadGroups = Mathf.CeilToInt(count / 256f);
+        physicsCompute.Dispatch(kernel, threadGroups, 1, 1);
     }
 
     private void ComputePositions()
     {
-        for (int i = 0; i < count; i++)
-        {
-            positions[i] += Time.fixedDeltaTime * velocities[i];
-            if (positions[i].x < bounds.min.x)
-            {
-                positions[i].x = bounds.min.x;
-                if (velocities[i].x < 0)
-                    velocities[i].x *= -0.5f;
-            }
-            if (positions[i].x > bounds.max.x)
-            {
-                positions[i].x = bounds.max.x;
-                if (velocities[i].x > 0)
-                    velocities[i].x *= -0.5f;
-            }
-            if (positions[i].y < bounds.min.y)
-            {
-                positions[i].y = bounds.min.y;
-                if (velocities[i].y < 0)
-                    velocities[i].y *= -0.5f;
-            }
-            if (positions[i].y > bounds.max.y)
-            {
-                positions[i].y = bounds.max.y;
-                if (velocities[i].y > 0)
-                    velocities[i].y *= -0.5f;
-            }
-            if (positions[i].z < bounds.min.z)
-            {
-                positions[i].z = bounds.min.z;
-                if (velocities[i].z < 0)
-                    velocities[i].z *= -0.5f;
-            }
-            if (positions[i].z > bounds.max.z)
-            {
-                positions[i].z = bounds.max.z;
-                if (velocities[i].z > 0)
-                    velocities[i].z *= -0.5f;
-            }
-        }
-        
+        int kernel = physicsCompute.FindKernel("ComputePositions");
+
+        physicsCompute.SetBuffer(kernel, "positions", posBuffer);
+        physicsCompute.SetBuffer(kernel, "velocities", velocityBuffer);
+
+        int threadGroups = Mathf.CeilToInt(count / 256f);
+        physicsCompute.Dispatch(kernel, threadGroups, 1, 1);
     }
 
     private void Draw()
@@ -209,6 +196,6 @@ public class WaterSim : MonoBehaviour
         {
             colors[i] = (velocities[i] / 10 + new Vector3(1, 1, 1)) / 2; 
         }
-        particleVisualizer.Draw(positions, 0.5f, colors);
+        particleVisualizer.Draw(positions, visualRadius, colors);
     }
 }
